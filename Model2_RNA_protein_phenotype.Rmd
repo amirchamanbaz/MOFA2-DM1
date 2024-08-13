@@ -1,0 +1,1051 @@
+---
+title: "042623_MOFA2_RNA_PROTEIN_PHENOTYPE"
+author: "Amir Chaman Baz"
+date: "4/26/2024"
+output: html_document
+---
+#-------------------------------------------------------------------------------
+#-----Model 2:This Script runs MOFA2 analysis on RNA, protein and phenotype data 
+#-----using a subset of the data to have 50% of all analyzed samples have 
+#-----RNA-data and maximize the amount of protein data within.
+#-----Outputs correlations data: rho, BH adjusted p-values for each factor and 
+#-----associated outcome
+#-----Outputs: Figure 1, 2 and 3b of Model 2 chapter in paper
+#-------------------------------------------------------------------------------
+
+```{r}
+#Select whether to run new MOFA2 analysis or load Mofaobject (Default=2)
+cat("run new MOFA model(1) or load from file(2)?: ")
+optionp<- readline()
+
+if(!optionp==1){
+  optionp<-2
+}
+```
+
+ 
+#Load libraries
+```{r}
+library(MOFA2)
+library(readxl)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(reshape2)
+library(ggplotify)
+library(gridExtra)
+library(gplots)
+library(corrplot)
+library(MASS)
+library(VennDiagram)
+library(ggcorrplot)
+library(viridis)
+library(ggpmisc)
+library(sysfonts)
+library(showtext)
+library(ggpubr)
+library(gprofiler2)
+library(mixOmics)
+library(psych)
+library(gtable)
+```
+
+```{r}
+#-----Add fonts for plots
+font.add("baskerville",
+         regular = "Libre_Baskerville(1)/LibreBaskerville-Regular.ttf",
+         bold = "Libre_Baskerville(1)/LibreBaskerville-Bold.ttf",
+         italic = "Libre_Baskerville(1)/LibreBaskerville-Italic.ttf")
+showtext.auto()
+```
+
+```{r}
+#-----Import functions used for plot generation
+source("importfunctions.R")
+
+```
+
+
+```{r}
+#-----Load genenames database (EnsDb.Hsapiens.v86.sqlite)
+library(RSQLite)
+dbfile <- "EnsDb.Hsapiens.v86.sqlite"
+con <- dbConnect(drv = RSQLite::SQLite(),
+                 dbname = dbfile)
+ensembltables <- dbListTables(con)
+
+ensembldf <- vector("list", length = length(ensembltables))
+
+for (i in seq(along = ensembltables)) {
+  ensembldf[[i]] <- dbGetQuery(
+    conn = con,
+    statement = paste("SELECT * FROM '",
+                      ensembltables[[i]],
+                      "'",
+                      sep = "")
+  )
+}
+
+genenames <- data.frame(gene_id = ensembldf[[4]]$gene_id,
+                        gene_name = ensembldf[[4]]$gene_name)
+```
+
+```{r}
+#-----Load proteinnames from database (UniprotKB)
+file <- "HUMAN_9606_idmapping_selected.tab/HUMAN_9606_idmapping_selected.tab"
+proteindf <- read.csv(file,
+                      sep = "\t",
+                      header = FALSE)
+
+proteinnames <- data.frame(protein.id = proteindf$V1,
+                           protein.name = proteindf$V2)
+
+file <- NULL
+
+#Remove substring "_HUMAN" from proteinnames
+proteinnames$protein.name <-substring(proteinnames$protein.name,
+                                      1,
+                                      nchar(proteinnames$protein.name) - 6)
+
+```
+
+ 
+#Load data from external files
+```{r}
+#Loading data from external files
+load(file.choose())
+pdf$PatientID <- gsub("_V.", "", rownames(pdf))
+
+load(file.choose())
+rna_counts <- data.frame(v$E)
+
+df <- read_excel(file.choose(), sheet = 1)
+df <- as.data.frame(df)
+names(df)[names(df) == "PatientID...1"] <- "sample"
+```
+
+```{r}
+#import Gprofiler results (RDS)
+if(optionp==2){
+gsearesults <- readRDS(file.choose()) 
+} 
+```
+  
+
+```{r}
+#Calculate StroopInterference and TMT 
+stroop2V2 <-
+  ((60 - df$StroopCardIIErrorsV2) / 60) / df$StroopCardIITimeV2
+stroop2V4 <-
+  ((60 - df$StroopCardIIErrorsV4) / 60) / df$StroopCardIITimeV4
+stroop3V2 <-
+  ((60 - df$StroopCardIIIErrorsV2) / 60) / df$StroopCardIIITimeV2
+stroop3V4 <-
+  ((60 - df$StroopCardIIIErrorsV4) / 60) / df$StroopCardIIITimeV4
+df$StroopInterferenceV2 <- stroop3V2 / stroop2V2
+df$StroopInterferenceV4 <- stroop3V4 / stroop2V4
+
+df$TMTV2 <- df$TMTBV2 / df$TMTAV2
+df$TMTV4 <- df$TMTBV4 / df$TMTAV4
+
+
+```
+
+
+```{r}
+#Selection of clinical outcomes from list
+#seperate two timepoints and merge 
+
+#select V2 vars only
+clindf<- df[colnames(df)[grep("*\\V2$", colnames(df))]] 
+#Select V4 vars only
+clindfv4<- df[colnames(df)[grep("*\\V4$", colnames(df))]]
+
+
+#remove all variables starting with Stroop
+clindf<- clindf[-grep("^Stroop.*$", colnames(clindf))] 
+clindfv4<- clindfv4[-grep("^Stroop.*$", colnames(clindfv4))] 
+      
+#Add Stroopinterference and TMT scores
+clindf$StroopInterferenceV2<- df$StroopInterferenceV2
+clindf$TMTV2<- df$TMTV2
+
+clindfv4$StroopInterferenceV4<- df$StroopInterferenceV4
+clindfv4$TMTV4<- df$TMTV4
+      
+#Remove TMTA en TMTB, PreBorg, MIRS, MCgillpain, l5ENMO, M5ENMO, SIPScore
+omitlist<- c(paste0("TMTBV2|TMTAV2|PreBORGV2|MIRSV2|McGillPainV2|",
+                          "L5ENMOV2|M5ENMOV2|SIPScoreV2"))
+clindf<- clindf[!grepl(omitlist, colnames(clindf))]
+      
+omitlist<- c(paste0("TMTBV4|TMTAV4|PreBORGV4|MIRSV4|McGillPainV4|",
+                          "L5ENMOV4|M5ENMOV4|SIPScoreV4"))
+clindfv4<- clindfv4[!grepl(omitlist, colnames(clindfv4))]
+
+#Add samplenames to both df      
+samplenames<- substring(df$sample, 1, nchar(df$sample)-1)
+rownames(clindf)<- paste0(samplenames,"_V2")
+rownames(clindfv4)<- paste0(samplenames,"_V4")
+      
+```
+
+```{r}
+#Remove V2/V4 from colnames, merge df's
+colnames(clindfv4)<- substring(colnames(clindfv4),
+                                     1, nchar(colnames(clindfv4))-2)
+colnames(clindf)<- substring(colnames(clindf), 
+                                     1, nchar(colnames(clindf))-2)
+clinicaloutcomescoresdf<- rbind(clindf, clindfv4)
+```
+
+```{r}
+#Filtered phenotypes  (Apply IQR_filter to clinicaloutcomes)
+clinfiltered<- lapply(clinicaloutcomescoresdf, function(x)IQR_filter(x,3)) 
+clinfiltered<- as.data.frame(clinfiltered)
+rownames(clinfiltered)<- rownames(clinicaloutcomescoresdf)
+
+numfiltered<-sum(is.na(clinfiltered)) - sum(is.na(clinicaloutcomescoresdf))
+paste0(numfiltered, " outliers filtered ") #Should be 5 outliers instead of 10 since we omitted clinical outcomes above
+
+clinicaloutcomescoresdf<- clinfiltered
+
+
+```
+
+
+```{r}
+#Make new dataframe clinoutcomes with transformed variables
+#based on BoxCox Transformation
+clinoutcomes<-clinicaloutcomescoresdf
+
+clinoutcomes$CISFatigue<- clinicaloutcomescoresdf$CISFatigue^2 
+clinoutcomes$BDIFs<- sqrt(clinicaloutcomescoresdf$BDIFs)
+clinoutcomes$SSLNScore<- 1/sqrt(clinicaloutcomescoresdf$SSLNScore)
+clinoutcomes$SSLDScore<- 1/sqrt(clinicaloutcomescoresdf$SSLDScore)
+clinoutcomes$JFCS<- 1/sqrt(clinicaloutcomescoresdf$JFCS)
+clinoutcomes$CISactivity<- clinicaloutcomescoresdf$CISactivity^2
+
+
+```
+
+
+```{r}
+#Z-score scaling for each clinical outcome measurement by variable
+clinoutcomes_scaled<- as.data.frame(lapply(clinoutcomes, 
+                                    function(x) 
+                                            scale(x, 
+                                                  center=TRUE, 
+                                                  scale = TRUE)))
+rownames(clinoutcomes_scaled)<- rownames(clinoutcomes)
+
+
+```
+
+```{r}
+#Z-score scaling for each rpc protein 
+rpc_scaled<- as.data.frame(apply(rpc, 1, 
+                                  function(x) 
+                                      scale(x, 
+                                            center=TRUE, 
+                                            scale = TRUE)))
+
+
+rpc_scaled<-t(rpc_scaled)
+colnames(rpc_scaled)<- colnames(rpc)
+rpc_scaled<- as.data.frame(rpc_scaled)
+```
+
+
+```{r}
+#Z-score scaling for each rna
+rna_scaled<- as.data.frame(apply(rna_counts, 1, 
+                                  function(x) 
+                                      scale(x, 
+                                            center=TRUE, 
+                                            scale = TRUE)))
+
+
+rna_scaled<-t(rna_scaled)
+colnames(rna_scaled)<- colnames(rna_counts)
+rna_scaled<- as.data.frame(rna_scaled)
+
+
+
+```
+
+
+   
+```{r}
+#-----Inverse clinical outcomes so they have have the same directionality (higher is better)
+clinoutcomes_scaled$MDHI <- clinoutcomes_scaled$MDHI*(-1)
+clinoutcomes_scaled$CISFatigue <- clinoutcomes_scaled$CISFatigue*(-1)
+clinoutcomes_scaled$INQOLQolScore <- clinoutcomes_scaled$INQOLQolScore*(-1)
+clinoutcomes_scaled$BDIFs <- clinoutcomes_scaled$BDIFs*(-1)
+clinoutcomes_scaled$AEScScore <- clinoutcomes_scaled$AEScScore*(-1)
+clinoutcomes_scaled$TMT <- clinoutcomes_scaled$TMT*(-1)
+clinoutcomes_scaled$ASBQ <- clinoutcomes_scaled$ASBQ*(-1)
+clinoutcomes_scaled$SSLDScore <- clinoutcomes_scaled$SSLDScore*(-1)
+clinoutcomes_scaled$SSLNScore <- clinoutcomes_scaled$SSLNScore*(-1)
+clinoutcomes_scaled$JFCS <- clinoutcomes_scaled$JFCS*(-1)
+clinoutcomes_scaled$IMQ <- clinoutcomes_scaled$IMQ*(-1)
+clinoutcomes_scaled$CISactivity <- clinoutcomes_scaled$CISactivity*(-1)
+clinoutcomes_scaled$FDSS <- clinoutcomes_scaled$FDSS*(-1)
+
+#CSI and AESI lower is better, added this
+clinoutcomes_scaled$CSI <- clinoutcomes_scaled$CSI*(-1)
+clinoutcomes_scaled$AESI <- clinoutcomes_scaled$AESI*(-1)
+
+```
+
+
+```{r}
+rna_counts2<- rna_scaled
+rpc2<- rpc_scaled
+#c----If you want to run the analysis on 1 timepoint:
+#c----rpc2<-rpc_scaled for scaled by protein
+#c----Select V2 only:
+#c----rna_counts2<- rna_counts2 %>% select(-ends_with("V4"))
+#c----rpc2<- rpc2 %>% select(-ends_with("V4"))
+#c----head(rna_counts2)
+#c----head(rpc2)
+
+#c----Add sample names and transpose clinical data to match rna and rpc
+#c----rownames(clinicaloutcomescoresdf)<-paste0(substring(df$sample,
+#c----                                                    1, 
+#c----                                                    nchar(df$sample)-1),
+#c----                                                    "_V2")
+      
+clinoutcomes_scaled<- t(clinoutcomes_scaled)
+clinoutcomes_scaled<- as.data.frame(clinoutcomes_scaled)
+```
+
+```{r}
+#Select 100 samples, subset contains all samples with RNA (n=54), 
+#maximize n samples who have protein data
+#Sample all RNA, all protein, all DM1Activ, All SMWT, 
+#<20% missing clinical outcome, then 
+#stratify male/female/timepoints
+
+
+nneeded<- 100- length(colnames(rna_counts2)) #46 samples to select
+
+mask<- !colnames(clinoutcomes_scaled) %in% colnames(rna_counts2)
+clin_no_rna<-clinoutcomes_scaled[,mask]
+
+mask<- !colnames(rpc2) %in% colnames(rna_counts2)
+prot_no_rna<- rpc2[,mask]
+
+prot_in_clin<- clin_no_rna[, colnames(prot_no_rna)]
+
+#-----Select only samples that have DM1ActivC and SMWT scores
+mask<- which(rownames(prot_in_clin)=="DM1ActivC"|rownames(prot_in_clin)=="SMWT")
+DM1SMWT<- prot_in_clin[mask, ]
+
+mask<-unlist(lapply(DM1SMWT, function(x) !is.na(sum(x))))
+prot_in_clin<-prot_in_clin[, mask]
+
+#-----Select only samples with >80% clinical outcomes
+mask<- unlist(lapply(prot_in_clin, function(x)(sum(!is.na(x))/length(x))>0.8))
+prot_in_clin<-prot_in_clin[, mask]
+
+
+prot_in_clin<- t(prot_in_clin)
+prot_in_clin<- as.data.frame(prot_in_clin)
+samples<- substring(rownames(prot_in_clin), 1, nchar(rownames(prot_in_clin))-3)
+
+
+
+#-----Add Sex data
+prot_in_clin$sex<-""
+for( y in samples){
+    prot_in_clin$sex[which(samples==y)]<- df$SexCode[which(substring(df$sample,1, nchar(df$sample)-1)==y)]   
+      }
+#-----Add timepoints
+prot_in_clin$timepoint<- substring(rownames(prot_in_clin), 
+                                         nchar(rownames(prot_in_clin))-1, 
+                                         nchar(rownames(prot_in_clin)))      
+      
+prot_in_clin$samplename<- rownames(prot_in_clin)
+
+#-----Select samples in the subset that have protein data for both timepoints
+samplenames<- substring(rownames(prot_in_clin), 1, nchar(rownames(prot_in_clin))-3)
+samplecounts<-table(samplenames)
+completeprotein<-paste0(names(samplecounts[samplecounts>1]), "_V2") 
+      
+      
+prot_in_clin_V2_subset<- prot_in_clin[grep(pattern = "_V2", rownames(prot_in_clin)),]
+prot_in_clin_V2_subset<- prot_in_clin_V2_subset[rownames(prot_in_clin_V2_subset) %in% completeprotein,]
+      
+set.seed(123)
+strat_norna<- prot_in_clin_V2_subset %>% 
+group_by(sex, timepoint) %>%
+sample_n(size=12)
+      
+paste0("sex")
+table(strat_norna$sex)
+paste0("timepoints")
+table(strat_norna$timepoint)
+#Find sample pair(other timepoint) and add to selection
+V4equivalent<- paste0(substring(strat_norna$samplename, 1, nchar(strat_norna$samplename)-3), "_V4")
+
+samplesselected<- c(colnames(rna_counts2), strat_norna$samplename, V4equivalent)
+print(samplesselected)
+
+```
+
+```{r}
+#-----subset Data based on the sampling above
+      
+rpc2<- rpc2[,samplesselected[samplesselected %in% colnames(rpc2)]]
+rna_counts2<- rna_counts2[,samplesselected[samplesselected %in% colnames(rna_counts2)]]
+clinoutcomes_scaled<- clinoutcomes_scaled[,samplesselected[samplesselected %in% colnames(clinoutcomes_scaled)]]
+      
+      
+#-----backup
+rna_counts3<- rna_counts2
+clinoutcomes_scaled3<- clinoutcomes_scaled
+
+```
+
+```{r}
+#-----Make rpc and rna_counts have equal samples by adding NA columns for the 
+#-----missing samples in each (This is required by MOFA2 )
+      
+mask<- !(colnames(clinoutcomes_scaled) %in% colnames(rpc2))
+missingsamples<- colnames(clinoutcomes_scaled)[mask]
+for (y in missingsamples ){
+            rpc2[[y]]<- NA
+          }
+      
+mask<- !(colnames(clinoutcomes_scaled) %in% colnames(rna_counts2))
+missingsamples<- colnames(clinoutcomes_scaled)[mask]
+for (y in missingsamples ){
+     rna_counts2[[y]]<- NA
+          }
+      
+rna_counts2<- rna_counts2[,order(colnames(rna_counts2))]
+rpc2<- rpc2[,order(colnames(rpc2))]
+clinoutcomes_scaled<- clinoutcomes_scaled[, order(colnames(clinoutcomes_scaled))]
+```
+ 
+```{r}
+#Build MOFA Object and Set Options
+#Default seed
+mofadata<-list(rna = as.matrix(rna_counts2), 
+                     protein= as.matrix(rpc2), 
+                     phenotype=as.matrix(clinoutcomes_scaled))
+MOFAobject<- create_mofa(mofadata)
+      
+      
+data_opts<- get_default_data_options(MOFAobject)
+model_opts<- get_default_model_options(MOFAobject)
+model_opts$num_factors<- 30 #Number of factors
+train_opts<- get_default_training_options(MOFAobject)
+train_opts$convergence_mode <- "slow"
+train_opts$maxiter<- 10000
+      
+MOFAobject <- prepare_mofa(MOFAobject, 
+                                 data_options= data_opts, 
+                                 model_options = model_opts, 
+                                 training_options = train_opts)
+
+```
+
+#load model or run mofa:
+```{r}
+mofaobjectfile<- file.choose()
+if(optionp==2){
+      MOFAobject_ran <- load_model(mofaobjectfile)}else if(optionp==1){
+        MOFAobject_ran<- run_mofa(MOFAobject, 
+                           outfile=file.choose(), 
+                           use_basilisk = FALSE)
+                          }
+```
+ 
+
+#load metadata in MOFAobject_ran: 
+```{r}
+df2<-df
+df2$sample<-paste0(substring(df2$sample, 1, nchar(df2$sample)-1))
+
+
+df3<-df2[1,]
+df3$timepoint<- ""
+df3<-df3[0,]
+
+#----For each sample V2 and V4, double metadata so every sample has 
+#----its own metadata entry
+for(g in df2$sample){
+          df3<-rbind(df3, 
+                     cbind(sample=paste0(g, "_V2"), 
+                           df2[which(df2$sample==g),-1], 
+                           timepoint=0), 
+                     cbind(sample=paste0(g, "_V4"), 
+                           df2[which(df2$sample==g),-1], 
+                           timepoint=1))
+          }
+
+
+df3$CTGDiagnostic<- as.numeric(df3$CTGDiagnostic)
+df3$V2Mode<- as.numeric(df3$V2Mode)
+df3$LogCTG_s<- scale(log(df3$CTGDiagnostic), 
+                           center=TRUE, 
+                           scale=TRUE)
+df3$AgeAtOnset<- as.numeric(df3$AgeAtOnset)
+
+#Select only the metadata of the 102 samples:
+df3_subset<- df3[df3$sample %in% samplesselected,]  
+      
+metadatadf<- cbind(df3_subset[!colnames(df3_subset) %in% rownames(clinoutcomes_scaled)],
+                                                t(clinoutcomes_scaled))
+samples_metadata(MOFAobject_ran) <- metadatadf
+      
+      
+      
+metadatadf<- t(metadatadf)
+metadatadf<- as.data.frame(metadatadf) 
+colnames(metadatadf)<- metadatadf[which(rownames(metadatadf)=="sample"),] 
+      
+   
+      
+      
+```
+
+
+```{r}
+#manual variance data:
+r2<- calculate_variance_explained(MOFAobject_ran)
+r2perfactor<- as.matrix(r2$r2_per_factor$group1)
+r2perfactor<- melt(r2perfactor)
+```
+
+
+
+```{r}
+#Generate R2 and  p-values of LM heatmap covariates ~ factors
+listn <-Corr_factors_R2(MOFAobject_ran, 
+                              covariates = c(#"TreatmentCode", 
+                                              "V2Age",
+                                              "AgeAtOnset",
+                                              "SexCode", 
+                                              "timepoint",
+                                              "CTGDiagnostic"), 
+                                              plot = "r")
+Z<- listn[[1]] #Retrieve Factor values per sample
+covariates <- listn[[2]] #Get covariates
+Z<-as.data.frame(Z)
+
+
+lmheatmap <- covariates[0, ] #Empty df with Covariate names as colnames
+lmheatmap_pval <- covariates[0, ]
+
+for(j in 1:30) {
+  l <- list()
+  pval <- list()
+  for (i in colnames(lmheatmap)) {
+    testdf <- data.frame(Z = Z[[j]], cov = covariates[[i]])
+    
+    lmmodel <- summary(lm(cov ~ Z, data = testdf))
+    l <- c(l, lmmodel$r.squared)
+    pval <- c(pval, lmmodel$coefficients[2, 4])
+  }
+  
+  l <- as.data.frame(t(l))
+  colnames(l) <- colnames(lmheatmap)
+  lmheatmap <- rbind(lmheatmap, l)
+  
+  pval <- as.data.frame(t(pval))
+  colnames(pval) <- colnames(lmheatmap_pval)
+  lmheatmap_pval <- rbind(lmheatmap_pval, pval)
+  
+}
+
+lmheatmap<- as.data.frame(lmheatmap)
+lmheatmap$V2Age<- as.numeric(lmheatmap$V2Age)
+lmheatmap$AgeAtOnset<- as.numeric(lmheatmap$AgeAtOnset)
+lmheatmap$SexCode<- as.numeric(lmheatmap$SexCode)
+lmheatmap$timepoint<- as.numeric(lmheatmap$timepoint)
+lmheatmap$CTGDiagnostic<- as.numeric(lmheatmap$CTGDiagnostic)
+
+rownames(lmheatmap)<- r2perfactor$Var1[1:30]
+lmheatmap$factor<- r2perfactor$Var1[1:30]
+lmmelt<- melt(lmheatmap, id.vars = "factor")
+
+lmheatmap_pval<- as.data.frame(lmheatmap_pval)
+lmheatmap_pval$V2Age<- as.numeric(lmheatmap_pval$V2Age)
+lmheatmap_pval$AgeAtOnset<- as.numeric(lmheatmap_pval$AgeAtOnset)
+lmheatmap_pval$SexCode<- as.numeric(lmheatmap_pval$SexCode)
+lmheatmap_pval$timepoint<- as.numeric(lmheatmap_pval$timepoint)
+lmheatmap_pval$CTGDiagnostic<- as.numeric(lmheatmap_pval$CTGDiagnostic)
+
+rownames(lmheatmap_pval)<- r2perfactor$Var1[1:30]
+lmheatmap_pval$factor<- r2perfactor$Var1[1:30]
+
+lmheatmap_pval<- melt(lmheatmap_pval, value.name = "pval")
+lmheatmap_pval<- as.data.frame(lmheatmap_pval)
+lmheatmap_pval$pval_adjusted<- p.adjust(lmheatmap_pval$pval, method = "BH")
+```
+
+
+
+```{r}
+#Get all weights (protein, phenotype)
+weights<- get_weights(MOFAobject_ran, views = "all", factors = "all")
+protein.weights<- as.data.frame(weights$protein)
+rna.weights<-as.data.frame(weights$rna)
+phenotype.weights<- as.data.frame(weights$phenotype)
+```
+
+```{r}
+#Visualise overview of Data in MOFAobject 
+plot_data_overview(MOFAobject)
+```
+
+#Sanity check; verify whether factors are largely uncorrelated:
+```{r}
+#Sanity check; verify whether factors are largely uncorrelated:
+plot_factor_cor(MOFAobject_ran)
+```
+
+```{r}
+#Get data on correlation of clinical outcomes with factors
+corr_factors_cov_spearman(MOFAobject_ran, covariates = rownames(clinoutcomes_scaled), plot = "r", return_data = TRUE)
+corr_factors_cov_spearman(MOFAobject_ran, covariates = rownames(clinoutcomes_scaled), plot = "pval", return_data = TRUE)
+```
+
+#generation of spearman correlations (Return data) 
+```{r}
+#Factor 6 correlations
+for(i in c("IMQ", "ICQ", "JFCS", "SSLIScore", "SSLDScore", "ASBQ", "BDIFs", "AEScScore")){
+corrfactortable<-regressor_rna(i, nfactor = 6, nfeature = 25, colby="timepoint", returncorr = TRUE)
+print(corrfactortable)
+print(paste0(i,":" , "BH adjusted pval:"))
+print(corrfactortable$p.adj)
+cat("-------------------------------\n\n")
+corrfactortable<- NULL
+}
+```
+
+#-------------------------------------------------------------------------------
+#All figures below: 
+```{r}
+#Scree plot
+screeplottable<- r2$r2_per_factor$group1
+screeplottable<- as.data.frame(screeplottable)
+screeplottable$total<- screeplottable$rna +
+    screeplottable$protein + screeplottable$phenotype
+
+screeplotfigure<- ggplot(screeplottable, aes(x=1:30, y= total)) + 
+    geom_line(lwd=1) + 
+    xlab("Factor") + 
+    ylab("Variance explained (%)") + 
+    scale_x_continuous(breaks = seq(1,30,1)) +
+    scale_y_continuous(breaks=seq(0,30,5))+
+    theme_minimal() +
+    theme(axis.text.x = element_text(size=15), axis.text.y = element_text(size=15), panel.background = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  theme(text=element_text(family = "baskerville")) +
+  geom_hline(yintercept = 0)+
+   geom_vline(xintercept = 0)
+		 
+print(screeplotfigure)
+``` 
+
+```{r}
+#Explained variance per factor (Fig1a)
+
+fig1a<- plot_variance_explained(MOFAobject_ran, plot_total = F)+
+  theme(text=element_text(family = "baskerville"))+
+  ggtitle("(a)")
+
+#Explained variance per covariate (Fig2b)
+fig1b<- ggplot(lmmelt, 
+       aes(x = variable, y = factor, fill = value)) +
+    geom_tile(color="black") +
+    theme_classic()+
+    theme(axis.line.y=element_blank(), axis.line.x=element_blank())+
+    scale_fill_gradient2(low = "white", 
+                         high = "navy", 
+                         limits=c(0,0.20), 
+                         oob = scales::squish) +
+    guides(fill=guide_colourbar(title="Var"))+
+       theme(text=element_text(family = "baskerville"), legend.position = "none")+
+  scale_y_discrete(labels=c(1:30))+
+ylab("")+
+xlab("")+
+  ggtitle("(b)")
+
+#Change names of covariates
+levels(fig1b$data$variable)<- c("Age", "Age(Onset)", "Sex", "Timepoint", "CTG")
+
+#Merge figures
+figure1<- ggarrange(fig1a, fig1b)
+print(figure1)
+```  
+
+```{r}
+#-----corr factors with clinical outcomes (spearman, BH) (Figure2)
+#-----Generates two figures, uses the pval as mask for the heatmap with rho
+#-----values
+colorhue<- colorRampPalette(c("#440154FF" ,"white", "#FDE725FF"))(n=300)    
+
+fig2a<- corr_factors_cov_spearman(MOFAobject_ran, covariates = rownames(clinoutcomes_scaled), plot = "r") +
+      scale_x_discrete(labels=c(1:30)) +
+      theme(axis.text.x = element_text(angle=0, vjust=0, hjust=0.5))+
+      scale_fill_gradient2(low="#440154FF", mid = "white", high = "#FDE725FF")+
+      theme(text=element_text(family = "baskerville"))+
+      guides(fill=guide_colourbar(title="rho"))+
+      ggtitle("")
+    
+      
+fig2b<- corr_factors_cov_spearman(MOFAobject_ran, covariates = rownames(clinoutcomes_scaled), plot = "pval") +
+      scale_x_discrete(labels=c(1:30)) +
+      theme(axis.text.x = element_text(angle=0, vjust=0, hjust=0.5))+
+      scale_fill_gradientn(colors=c("#440154FF","#FFFFFFFF"), values = c(0,0.05), na.value = "transparent")+
+      theme(text=element_text(family = "baskerville"))+
+      guides(fill=guide_colourbar(title="p-value"))+
+      ggtitle("(b)")
+
+
+      lev<- levels(fig2a$data$Var2)
+      lev[grep("SMWT", lev)]<-"6MWT"
+      levels(fig2a$data$Var2)<- lev
+
+      lev<- levels(fig2b$data$Var2)
+      lev[grep("SMWT", lev)]<-"6MWT"
+      levels(fig2b$data$Var2)<- lev
+
+
+      print(fig2a)
+      print(fig2b) 
+
+      fig2a$data$value[fig2b$data$value>0.05]<-0
+      #Print Figure 2
+      print(fig2a) 
+
+```
+
+```{r}
+#-----Heatmap Factor 1 (rna) with Loess lm method V2Mode over samples 
+tv<- plot_data_heatmap(MOFAobject_ran, 
+                       view="rna", 
+                       factor=1, 
+                       features=30, 
+                       cluster_cols= FALSE, 
+                       #cluster_rows= FALSE, 
+                  show_rownames= TRUE, show_colnames=TRUE, scale="row")
+#tv$gtable$grobs[[3]]$label<- mapRna(tv$gtable$grobs[[3]]$label)
+ 
+
+clintoplot<-metadatadf[which(rownames(metadatadf)=="V2Mode"),]
+rna_ss<- clintoplot[,colnames(clintoplot) %in% tv$gtable$grobs[[3]]$label]
+rna_ss<- rna_ss[, tv$gtable$grobs[[3]]$label]
+rna_ss<- t(rna_ss)
+rna_ss<- as.data.frame(rna_ss)
+rna_ss$rank<- c(1:nrow(rna_ss))
+rna_ss$V2Mode<- as.numeric(rna_ss$V2Mode)
+
+clinline<- ggplot(rna_ss, aes(x=rank, y=V2Mode))+
+geom_smooth(method="loess", se=TRUE, color="347FC4")+
+theme_minimal() +
+coord_cartesian(ylim=c(100,800))+
+scale_x_discrete(lim=c(1:54))+
+scale_y_continuous(position = "right")+
+xlab("")+
+ylab("CTG")+ 
+theme(axis.text.y = element_text(size=8), axis.text.x=element_blank(), panel.grid.minor = element_blank(),panel.grid.major = element_blank(), panel.background = element_blank(), panel.border = element_rect( colour="grey", linewidth=1, fill=NA))
+
+tv<- plot_data_heatmap2(MOFAobject_ran, 
+                       view="rna", 
+                       factor=1, 
+                       features=30, 
+                       cluster_cols= FALSE, 
+                       cluster_rows= FALSE, 
+                  show_rownames= TRUE, show_colnames=FALSE, scale="row", denoise=TRUE)
+tv$gtable$grobs[[2]]$label<- mapRna(tv$gtable$grobs[[2]]$label)
+dev.off()
+grid::grid.draw(tv$gtable)
+
+
+ggarrange(clinline+
+              theme(plot.margin = margin(5,102,-15,5)), as.ggplot(gtable_add_cols(tv$gtable, unit(5,"null"),-1)), ncol = 1, nrow = 2, heights =c(0.10,0.9))
+
+
+```
+
+
+```{r}
+#-----Heatmap Factor 23 (rna) with Loess lm method V2Mode over samples 
+tv<- plot_data_heatmap(MOFAobject_ran, 
+                       view="rna", 
+                       factor=23, 
+                       features=30, 
+                       cluster_cols= FALSE, 
+                  show_rownames= TRUE, show_colnames=TRUE, scale="row")
+tv$gtable$grobs[[3]]$label<- mapRna(tv$gtable$grobs[[3]]$label)
+ 
+
+clintoplot<-metadatadf[which(rownames(metadatadf)=="V2Mode"),]
+rna_ss<- clintoplot[,colnames(clintoplot) %in% tv$gtable$grobs[[3]]$label]
+rna_ss<- rna_ss[, tv$gtable$grobs[[3]]$label]
+rna_ss<- t(rna_ss)
+rna_ss<- as.data.frame(rna_ss)
+rna_ss$rank<- c(1:nrow(rna_ss))
+rna_ss$V2Mode<- as.numeric(rna_ss$V2Mode)
+
+clinline<- ggplot(rna_ss, aes(x=rank, y=V2Mode))+
+geom_smooth(method="loess", se=TRUE, color="347FC4")+
+theme_minimal() +
+coord_cartesian(ylim=c(100,800))+
+scale_x_discrete(lim=c(1:54))+
+scale_y_continuous(position = "right")+
+xlab("")+
+ylab("CTG")+
+theme(axis.text.y = element_text(size=8), axis.text.x=element_blank(), panel.grid.minor = element_blank(),panel.grid.major = element_blank(), panel.background = element_blank(), panel.border = element_rect( colour="grey", linewidth=1, fill=NA))
+
+tv<- plot_data_heatmap(MOFAobject_ran,  
+                       view="rna", 
+                       factor=23, 
+                       features=30, 
+                       cluster_cols= FALSE, 
+                  show_rownames= TRUE, show_colnames=FALSE, scale="row", denoise=TRUE)
+tv$gtable$grobs[[3]]$label<- mapRna(tv$gtable$grobs[[3]]$label)
+dev.off()
+grid::grid.draw(tv$gtable)
+
+
+ggarrange(clinline+
+              theme(plot.margin = margin(5,102,-15,55)), as.ggplot(gtable_add_cols(tv$gtable, unit(5,"null"),-1)), ncol = 1, nrow = 2, heights =c(0.10,0.9))
+
+
+```
+
+
+
+
+```{r}
+#-----Heatmap Factor 2 (rna) with Loess lm method 6MWT over samples 
+tv<- plot_data_heatmap(MOFAobject_ran, 
+                       view="rna", 
+                       factor=2, 
+                       features=25, 
+                       cluster_cols= FALSE, 
+                  show_rownames= TRUE, show_colnames=TRUE, scale="row")
+tv$gtable$grobs[[3]]$label<- mapRna(tv$gtable$grobs[[3]]$label)
+
+
+SMWT<-clinoutcomes_scaled[which(rownames(clinoutcomes_scaled)=="SMWT"),]
+SMWT_rna_ss<- SMWT[,colnames(SMWT) %in% tv$gtable$grobs[[3]]$label]
+SMWT_rna_ss<- SMWT_rna_ss[, tv$gtable$grobs[[3]]$label]
+SMWT_rna_ss<- t(SMWT_rna_ss)
+SMWT_rna_ss<- as.data.frame(SMWT_rna_ss)
+SMWT_rna_ss$rank<- c(1:nrow(SMWT_rna_ss))
+
+smwtline<-ggplot(SMWT_rna_ss, aes(x=rank, y=SMWT))+
+geom_smooth(method="loess", se=TRUE, color="347FC4")+
+theme_minimal() +
+coord_cartesian(ylim=c(-0.5,0.5))+
+scale_x_discrete(lim=c(1:54))+
+scale_y_continuous(position = "right")+
+xlab("")+
+ylab("6MWT")+
+theme(axis.text.y = element_text(size=8), axis.text.x=element_blank(), panel.grid.minor = element_blank(),panel.grid.major = element_blank(), panel.background = element_blank(), panel.border = element_rect( colour="grey", linewidth=1, fill=NA))
+
+tv<- plot_data_heatmap(MOFAobject_ran, 
+                       view="rna", 
+                       factor=2, 
+                       features=25, 
+                       cluster_cols= FALSE, 
+                  show_rownames= TRUE, show_colnames=FALSE, scale="row")
+tv$gtable$grobs[[3]]$label<- mapRna(tv$gtable$grobs[[3]]$label)
+dev.off()
+grid::grid.draw(tv$gtable)
+
+
+ggarrange(smwtline+
+              theme(plot.margin = margin(5,98,-15,55)), 
+          as.ggplot(gtable_add_cols(tv$gtable, unit(5,"null"),-1)), 
+          ncol = 1, nrow = 2, heights =c(0.10,0.9))
+
+
+```
+
+```{r}
+#-----Heatmap Factor 3 (protein) with Loess lm method FDSS over samples 
+tv<- plot_data_heatmap(MOFAobject_ran,  
+                       view="protein", 
+                       factor=3, 
+                       features=30, 
+                       cluster_cols= FALSE, 
+                  show_rownames= TRUE, show_colnames=TRUE, scale="row", denoise=TRUE)
+tv$gtable$grobs[[3]]$label<- mapRna(tv$gtable$grobs[[3]]$label)
+
+
+FDSS<-clinoutcomes_scaled[which(rownames(clinoutcomes_scaled)=="FDSS"),]
+FDSS_rna_ss<- FDSS[,colnames(FDSS) %in% tv$gtable$grobs[[3]]$label]
+FDSS_rna_ss<- FDSS_rna_ss[, tv$gtable$grobs[[3]]$label]
+FDSS_rna_ss<- t(FDSS_rna_ss)
+FDSS_rna_ss<- as.data.frame(FDSS_rna_ss)
+FDSS_rna_ss$rank<- c(1:nrow(FDSS_rna_ss))
+
+FDSSline<-ggplot(FDSS_rna_ss, aes(x=rank, y=FDSS))+
+geom_smooth(method="loess", se=TRUE, color="347FC4")+
+theme_minimal() +
+coord_cartesian(ylim=c(-2,2))+
+scale_x_discrete(lim=c(1:54))+
+scale_y_continuous(position = "right")+
+xlab("")+
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(
+      colour = "grey",
+      linewidth = 1,
+      fill = NA
+    )
+  )
+
+CISa<-clinoutcomes_scaled[which(rownames(clinoutcomes_scaled)=="CISactivity"),]
+CISa_rna_ss<- CISa[,colnames(CISa) %in% tv$gtable$grobs[[3]]$label]
+CISa_rna_ss<- CISa_rna_ss[, tv$gtable$grobs[[3]]$label]
+CISa_rna_ss<- t(CISa_rna_ss)
+CISa_rna_ss<- as.data.frame(CISa_rna_ss)
+CISa_rna_ss$rank<- c(1:nrow(CISa_rna_ss))
+
+CISaline<-ggplot(CISa_rna_ss, aes(x=rank, y=CISactivity))+
+geom_smooth(method="loess", se=TRUE, color="347FC4")+
+theme_minimal() +
+coord_cartesian(ylim=c(-2,2))+
+scale_x_discrete(lim=c(1:54))+
+scale_y_continuous(position = "right")+
+xlab("")+
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(
+      colour = "grey",
+      linewidth = 1,
+      fill = NA
+    )
+  )
+
+CISf<-clinoutcomes_scaled[which(rownames(clinoutcomes_scaled)=="CISFatigue"),]
+CISf_rna_ss<- CISf[,colnames(CISf) %in% tv$gtable$grobs[[3]]$label]
+CISf_rna_ss<- CISf_rna_ss[, tv$gtable$grobs[[3]]$label]
+CISf_rna_ss<- t(CISf_rna_ss)
+CISf_rna_ss<- as.data.frame(CISf_rna_ss)
+CISf_rna_ss$rank<- c(1:nrow(CISf_rna_ss))
+
+CISfline<-ggplot(CISf_rna_ss, aes(x=rank, y=CISFatigue))+
+geom_smooth(method="loess", se=TRUE, color="347FC4")+
+theme_minimal() +
+coord_cartesian(ylim=c(-2,2))+
+scale_x_discrete(lim=c(1:54))+
+scale_y_continuous(position = "right")+
+xlab("")+
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(
+      colour = "grey",
+      linewidth = 1,
+      fill = NA
+    )
+  )
+
+
+
+tv<- plot_data_heatmap(MOFAobject_ran, 
+                       view="protein", 
+                       factor=3, 
+                       features=30, 
+                       cluster_cols= FALSE, 
+                  show_rownames= TRUE, show_colnames=FALSE, scale="row", denoise=TRUE)
+tv$gtable$grobs[[3]]$label<- mapProtein(tv$gtable$grobs[[3]]$label)
+dev.off()
+grid::grid.draw(tv$gtable)
+
+
+ggarrange(
+  CISaline +
+    theme(plot.margin = margin(5, 130, -15, 55)),
+  as.ggplot(gtable_add_cols(tv$gtable, unit(5, "null"), -1)),
+  CISfline +
+    theme(plot.margin = margin(5, 130, -15, 55)),
+  as.ggplot(gtable_add_cols(tv$gtable, unit(5, "null"), -1)),
+  FDSSline +
+    theme(plot.margin = margin(5, 130, -15, 55)),
+  as.ggplot(gtable_add_cols(tv$gtable, unit(5, "null"), -1)),
+  ncol = 1,
+  nrow = 4,
+  heights = c(0.10, 0.9)
+)
+
+ 
+```
+
+```{r} 
+#Table (features with highest weight) generation
+
+for(i in c(1:30)){
+print(plot_top_weights(MOFAobject_ran, view="phenotype", factor=i, nfeatures=22, scale=T) +
+  theme(text=element_text(family = "baskerville"))) 
+
+for(j in c("protein", "rna")){
+print(plot_weights_mapped(MOFAobject_ran, view=j, factor=i, nfeatures=25, scale=T, genenames = genenames)+
+  theme(text=element_text(family = "baskerville")))
+}
+}
+
+```
+
+```{r}
+#Get all rna weights to perform GSEA Gprofiler (See Gprofiler GSEA script): 
+#rnaweights<- get_weights(MOFAobject_ran, views="rna", factors="all")
+#write.csv(rnaweights, file.choose())
+```
+
+
+
+```{r}
+#-----Print all GSEA tables
+for (i in as.character(c(1:30))){
+  
+  if(length(gsearesults[[i]])>0){
+  p<-publish_gosttable(gsearesults[[i]])+
+      ggtitle(paste0("Factor ", i))
+  print(p)
+  }
+  
+} 
+
+```
+
+```{r}
+#Get list of top 25 highest weights for export to complete dataset (Model 1 script)
+
+for(i in c(1:30)){
+topweights_protein<- get_weights(MOFAobject_ran, 
+                                 views="protein", 
+                                 factors=i)
+colnames(topweights_protein$protein)<- "factor"
+topweights_protein<- as.data.frame(topweights_protein)
+topweights_protein$protein<- rownames(topweights_protein)
+topweights_protein$factor<- abs(topweights_protein$factor)
+topweights_protein<- topweights_protein[order(topweights_protein$factor, decreasing = TRUE),]
+protlist25<-paste(unlist(rownames(topweights_protein)[1:25]), collapse = ",")
+print(paste0("Factor",i, ":", protlist25))
+}
+```
+
+
+
+

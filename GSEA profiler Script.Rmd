@@ -1,0 +1,75 @@
+---
+title: "GSEA Gprofiler analysis"
+author: "Amir Abbas Chaman Baz"
+date: "2024-05-14"
+output: html_document
+---
+###############################################################################
+Script to perform ORA analysis using Gprofiler2 on the weights extracted from 
+the MOFA2 model. 
+Input= CSV file with weights from MOFA2
+
+Output= RDS file to be loaded for use with MOFA2
+OR
+Output=CSV file with all results in a table (For paper)
+
+###############################################################################
+```{r}
+library(gprofiler2)
+library(rio)
+```
+
+```{r}
+weights<-read.csv("061024_weightsfordownstreamanalysis.csv")
+#Background of analysis is all genes in data
+background<- weights$X
+```
+ 
+```{r}
+
+results<- list()
+it<-1
+for( i in colnames(weights[,-1])){
+#Get the 500 genes with highest absolute weights
+weightlist<-weights[order(abs(weights[[i]]), decreasing = TRUE),][1:500,]$X
+
+t<- gost(query=weightlist, organism ="hsapiens", ordered_query = TRUE,
+         measure_underrepresentation = FALSE, evcodes = TRUE,
+         user_threshold = 0.05, correction_method = "g_SCS",
+         domain_scope = "custom", custom_bg = background,
+         numeric_ns ="", sources = c("WP"), as_short_link = FALSE)
+results<- append(results, list(it=t))
+print(it)
+it<- it+1
+}
+#Results is a named list 
+names(results)<- c(1:30)
+
+```
+
+```{r}
+#Export results to RDS file
+export(results, file.choose(), format="RDS")
+```
+
+```{r}
+#build final table
+#Alternatively, load from file:
+#res<-readRDS(file.choose())
+res<- results
+
+df<-res[[1]]$result[0,]
+m<-data.frame()
+x<-1
+for(i in res){
+if(length(i)>0){
+m<-as.data.frame(i$result)
+m$query<- paste(x)
+df<- rbind(df, m)
+}
+x<-x+1
+}
+
+df <- apply(df,2,as.character)
+write.csv("gseatableforpublishing2.csv", x=df)
+```

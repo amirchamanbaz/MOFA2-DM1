@@ -1,0 +1,651 @@
+---
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+------
+      title: "Multi-omics analysis"
+      author: "Amir Chaman Baz"
+      date: "4/5/2024"
+      output:
+      pdf_document: default
+      html_document: default
+------
+#------------------------------------------------------------------------------------
+# Script for Model 1; MOFA2 analysis of Protein+Phenomics using the complete data set
+#------------------------------------------------------------------------------------
+```{r}
+#Select whether to run new MOFA2 analysis or load Mofaobject (Default=2)
+cat("run new MOFA model(1) or load from file(2)?: ")
+optionp<- readline()
+
+if(!optionp==1){
+  optionp<-2
+}
+```
+
+#Load libraries
+```{r}
+      library(MOFA2)
+      library(readxl)
+      library(dplyr)
+      library(purrr)
+      library(ggplot2)
+      library(reshape2)
+      library(ggplotify)
+      library(gridExtra)
+      library(gplots)
+      library(corrplot)
+      library(MASS)
+      library(VennDiagram)
+      library(ggcorrplot)
+      library(viridis)
+      library(ggpmisc)
+      library(sysfonts)
+      library(showtext)
+      library(ggpubr)
+      library(psych)
+      font.add("baskerville", regular="Libre_Baskerville(1)/LibreBaskerville-Regular.ttf", bold="Libre_Baskerville(1)/LibreBaskerville-Bold.ttf", italic = "Libre_Baskerville(1)/LibreBaskerville-Italic.ttf" )
+      showtext.auto()
+``` 
+
+```{r}
+#-----Import functions used for plot generation
+source("importfunctions.R")
+
+```
+
+```{r}
+#Load genenames database (EnsDb.Hsapiens.v86.sqlite)
+library(RSQLite)
+dbfile <- "EnsDb.Hsapiens.v86.sqlite"
+con <- dbConnect(drv = RSQLite::SQLite(),
+                 dbname = dbfile)
+ensembltables <- dbListTables(con)
+
+ensembldf <- vector("list", length = length(ensembltables))
+
+for (i in seq(along = ensembltables)) {
+  ensembldf[[i]] <-
+    dbGetQuery(
+      conn = con,
+      statement = paste("SELECT * FROM '", ensembltables[[i]], "'", sep = "")
+    )
+}
+
+genenames <- data.frame(gene_id = ensembldf[[4]]$gene_id,
+                        gene_name = ensembldf[[4]]$gene_name)
+```
+
+```{r}
+#Load proteinnames from database (UniprotKB)
+file<- "HUMAN_9606_idmapping_selected.tab/HUMAN_9606_idmapping_selected.tab"
+proteindf<- read.csv(file, 
+                    sep="\t", 
+                    header=FALSE)
+      
+proteinnames<- data.frame(protein.id=proteindf$V1, 
+                          protein.name=proteindf$V2)
+      
+file<- NULL
+
+#Remove substring "_HUMAN" from proteinnames
+proteinnames$protein.name<- substring(proteinnames$protein.name, 1, nchar(proteinnames$protein.name)-6)
+```
+
+
+
+```{r}
+#-----Load data from external files
+load(file.choose())
+pdf$PatientID<- gsub("_V.", "", rownames(pdf))
+
+load(file.choose())
+rna_counts<- data.frame(v$E)
+
+df<- read_excel(file.choose(), sheet=1)
+df<- as.data.frame(df)
+names(df)[names(df)=="PatientID...1"]<- "sample"
+```
+
+
+```{r}
+#Calculate StroopInterference and TMT 
+stroop2V2<- ((60-df$StroopCardIIErrorsV2) / 60) / df$StroopCardIITimeV2
+stroop2V4<- ((60-df$StroopCardIIErrorsV4) / 60) / df$StroopCardIITimeV4
+stroop3V2<- ((60-df$StroopCardIIIErrorsV2) / 60) / df$StroopCardIIITimeV2
+stroop3V4<- ((60-df$StroopCardIIIErrorsV4) / 60) / df$StroopCardIIITimeV4
+df$StroopInterferenceV2<- stroop3V2 / stroop2V2
+df$StroopInterferenceV4<- stroop3V4 / stroop2V4
+
+df$TMTV2<- df$TMTBV2 / df$TMTAV2
+df$TMTV4<- df$TMTBV4 / df$TMTAV4
+
+
+```
+
+
+```{r}
+#Selection of clinical outcomes from list
+#seperate two timepoints and merge 
+
+#select V2 vars only
+clindf<- df[colnames(df)[grep("*\\V2$", colnames(df))]] 
+#Select V4 vars only
+clindfv4<- df[colnames(df)[grep("*\\V4$", colnames(df))]]
+
+
+#remove all variables starting with Stroop
+clindf<- clindf[-grep("^Stroop.*$", colnames(clindf))] 
+clindfv4<- clindfv4[-grep("^Stroop.*$", colnames(clindfv4))] 
+      
+#Add Stroopinterference and TMT scores
+clindf$StroopInterferenceV2<- df$StroopInterferenceV2
+clindf$TMTV2<- df$TMTV2
+
+clindfv4$StroopInterferenceV4<- df$StroopInterferenceV4
+clindfv4$TMTV4<- df$TMTV4
+      
+#Remove TMTA en TMTB, PreBorg, MIRS, MCgillpain, l5ENMO, M5ENMO, SIPScore
+omitlist<- c(paste0("TMTBV2|TMTAV2|PreBORGV2|MIRSV2|McGillPainV2|",
+                          "L5ENMOV2|M5ENMOV2|SIPScoreV2"))
+clindf<- clindf[!grepl(omitlist, colnames(clindf))]
+      
+omitlist<- c(paste0("TMTBV4|TMTAV4|PreBORGV4|MIRSV4|McGillPainV4|",
+                          "L5ENMOV4|M5ENMOV4|SIPScoreV4"))
+clindfv4<- clindfv4[!grepl(omitlist, colnames(clindfv4))]
+
+#Add samplenames to both df      
+samplenames<-substring(df$sample, 1, nchar(df$sample)-1)
+rownames(clindf)<-paste0(samplenames,"_V2")
+rownames(clindfv4)<-paste0(samplenames,"_V4")
+      
+```
+
+```{r}
+#-----Remove V2/V4 from colnames, merge df's
+colnames(clindfv4)<- substring(colnames(clindfv4),
+                                     1, nchar(colnames(clindfv4))-2)
+colnames(clindf)<- substring(colnames(clindf), 
+                                     1, nchar(colnames(clindf))-2)
+clinicaloutcomescoresdf<- rbind(clindf, clindfv4)
+```
+
+
+
+```{r}
+#Filtered phenotypes (Apply IQR_filter to clinicaloutcomes)
+clinfiltered<- lapply(clinicaloutcomescoresdf, function(x)IQR_filter(x,3)) 
+clinfiltered<- as.data.frame(clinfiltered)
+rownames(clinfiltered)<- rownames(clinicaloutcomescoresdf)
+
+numfiltered<-sum(is.na(clinfiltered)) - sum(is.na(clinicaloutcomescoresdf))
+paste0(numfiltered, " outliers filtered ") #Should be 5 outliers
+
+clinicaloutcomescoresdf<- clinfiltered
+
+
+```
+
+```{r}
+#Make new dataframe clinoutcomes with transformed variables
+clinoutcomes<-clinicaloutcomescoresdf
+
+clinoutcomes$CISFatigue<- clinicaloutcomescoresdf$CISFatigue^2 
+clinoutcomes$BDIFs<- sqrt(clinicaloutcomescoresdf$BDIFs)
+clinoutcomes$SSLNScore<- 1/sqrt(clinicaloutcomescoresdf$SSLNScore)
+clinoutcomes$SSLDScore<- 1/sqrt(clinicaloutcomescoresdf$SSLDScore)
+clinoutcomes$JFCS<- 1/sqrt(clinicaloutcomescoresdf$JFCS)
+clinoutcomes$CISactivity<- clinicaloutcomescoresdf$CISactivity^2
+
+
+```
+
+
+```{r}
+#-----Z-score scaling for each clinical outcome measurement by variable
+clinoutcomes_scaled<- as.data.frame(lapply(clinoutcomes, 
+                                                 function(x) 
+                                                          scale(x, 
+                                                          center=TRUE, 
+                                                          scale = TRUE)))
+rownames(clinoutcomes_scaled)<- rownames(clinoutcomes)
+
+
+```
+
+```{r}
+#Z-score scaling for each rpc protein 
+rpc_scaled<- as.data.frame(apply(rpc, 1, 
+                                  function(x) 
+                                      scale(x, 
+                                            center=TRUE, 
+                                            scale = TRUE)))
+
+
+rpc_scaled<-t(rpc_scaled)
+colnames(rpc_scaled)<- colnames(rpc)
+rpc_scaled<- as.data.frame(rpc_scaled)
+```
+
+```{r}
+#Inverse clinical outcomes so they have have the same directionality (higher is better)
+clinoutcomes_scaled$MDHI <- clinoutcomes_scaled$MDHI*(-1)
+clinoutcomes_scaled$CISFatigue <- clinoutcomes_scaled$CISFatigue*(-1)
+clinoutcomes_scaled$INQOLQolScore <- clinoutcomes_scaled$INQOLQolScore*(-1)
+clinoutcomes_scaled$BDIFs <- clinoutcomes_scaled$BDIFs*(-1)
+clinoutcomes_scaled$AEScScore <- clinoutcomes_scaled$AEScScore*(-1)
+clinoutcomes_scaled$TMT <- clinoutcomes_scaled$TMT*(-1)
+clinoutcomes_scaled$ASBQ <- clinoutcomes_scaled$ASBQ*(-1)
+clinoutcomes_scaled$SSLDScore <- clinoutcomes_scaled$SSLDScore*(-1)
+clinoutcomes_scaled$SSLNScore <- clinoutcomes_scaled$SSLNScore*(-1)
+clinoutcomes_scaled$JFCS <- clinoutcomes_scaled$JFCS*(-1)
+clinoutcomes_scaled$IMQ <- clinoutcomes_scaled$IMQ*(-1)
+clinoutcomes_scaled$CISactivity <- clinoutcomes_scaled$CISactivity*(-1)
+clinoutcomes_scaled$FDSS <- clinoutcomes_scaled$FDSS*(-1)
+
+#CSI and AESI lower is better, added this
+clinoutcomes_scaled$CSI <- clinoutcomes_scaled$CSI*(-1)
+clinoutcomes_scaled$AESI <- clinoutcomes_scaled$AESI*(-1)
+
+```
+
+```{r}
+#-----Create backups of rna and rpc 
+rna_counts2<- rna_counts
+rpc2<-rpc_scaled
+
+      
+clinoutcomes_scaled<-t(clinoutcomes_scaled)
+clinoutcomes_scaled<- as.data.frame(clinoutcomes_scaled)
+      
+rna_counts3<- rna_counts2
+clinoutcomes_scaled3<- clinoutcomes_scaled
+rpc3<-rpc2
+     
+      
+```
+
+```{r}
+#Make rpc and rna_counts have equal samples by adding NA columns for the 
+#missing samples in each
+      
+mask<- !(colnames(clinoutcomes_scaled) %in% colnames(rpc2))
+missingsamples<- colnames(clinoutcomes_scaled)[mask]
+      for (y in missingsamples ){
+            rpc2[[y]]<- NA
+          }
+      
+      mask<- !(colnames(clinoutcomes_scaled) %in% colnames(rna_counts2))
+      missingsamples<- colnames(clinoutcomes_scaled)[mask]
+      for (y in missingsamples ){
+            rna_counts2[[y]]<- NA
+          }
+      
+      rna_counts2<- rna_counts2[,order(colnames(rna_counts2))]
+      rpc2<- rpc2[,order(colnames(rpc2))]
+      clinoutcomes_scaled<- clinoutcomes_scaled[, order(colnames(clinoutcomes_scaled))]
+```
+  
+```{r}
+#Build MOFA Object and Set Options (Slow convergence, max iteration 10000)
+      mofadata<-list(#rna = as.matrix(rna_counts2), 
+                     protein= as.matrix(rpc2), 
+                     phenotype=as.matrix(clinoutcomes_scaled))
+      MOFAobject<- create_mofa(mofadata)
+      
+      
+      data_opts<- get_default_data_options(MOFAobject)
+      model_opts<- get_default_model_options(MOFAobject)
+      model_opts$num_factors<- 15 #Number of factors
+      train_opts<- get_default_training_options(MOFAobject)
+      train_opts$convergence_mode <- "slow"
+      train_opts$maxiter<- 10000
+      
+      MOFAobject <- prepare_mofa(MOFAobject, 
+                                 data_options= data_opts, 
+                                 model_options = model_opts, 
+                                 training_options = train_opts)
+
+
+```
+  
+
+
+```{r}
+#load model:
+mofaobjectfile<-file.choose()
+      if(optionp==2){
+      MOFAobject_ran<- load_model(mofaobjectfile)}else if(optionp==1){
+        MOFAobject_ran<- run_mofa(MOFAobject, 
+                           outfile=file.choose(), 
+                           use_basilisk = FALSE)
+                          }
+```
+#-------------------------------------------------------------------------------
+
+
+```{r}
+#load metadata in MOFAobject_ran: 
+      df2<-df
+      df2$sample<-paste0(substring(df2$sample, 1, nchar(df2$sample)-1))
+
+
+      df3<-df2[1,]
+      df3$timepoint<- ""
+      df3<-df3[0,]
+
+#For each sample V2 and V4, double metadata so every sample has 
+#its own metadata entry
+      for(g in df2$sample){
+          df3<-rbind(df3, 
+                     cbind(sample=paste0(g, "_V2"), df2[which(df2$sample==g),-1], timepoint=0), 
+                     cbind(sample=paste0(g, "_V4"), df2[which(df2$sample==g),-1], timepoint=1))
+          }
+
+
+      df3$CTGDiagnostic<- as.numeric(df3$CTGDiagnostic)
+      df3$LogCTG_s<- scale(log(df3$CTGDiagnostic), center=TRUE, scale=TRUE)
+      df3$AgeAtOnset<- as.numeric(df3$AgeAtOnset)
+      metadatadf<- cbind(df3[!colnames(df3) %in% rownames(clinoutcomes_scaled)], t(clinoutcomes_scaled))
+      samples_metadata(MOFAobject_ran) <- metadatadf
+      metadatadf<- t(metadatadf)
+      metadatadf<- as.data.frame(metadatadf) 
+      colnames(metadatadf)<- metadatadf[which(rownames(metadatadf)=="sample"),] 
+```
+ 
+#-------------------------------------------------------------------------------
+#-----Start of Plot generation
+
+```{r}
+#manual variance data:
+r2 <- calculate_variance_explained(MOFAobject_ran)
+r2perfactor<-as.matrix(r2$r2_per_factor$group1)
+r2perfactor<- melt(r2perfactor)
+```
+
+```{r}
+#LM function factors ~ covariates
+#returns both the R2 as well as the BH adjusted p.val
+listn <-Corr_factors_R2(MOFAobject_ran, 
+                covariates = c(#"TreatmentCode", 
+                               "V2Age",
+                               "AgeAtOnset",
+                               "SexCode", 
+                            "timepoint",
+                               "CTGDiagnostic"), 
+                plot = "r")
+Z<- listn[[1]] #Retrieve Factor values per sample
+covariates <- listn[[2]] #Get covariates
+Z<-as.data.frame(Z)
+
+
+lmheatmap<-covariates[0,] #Empty df with Covariate names as colnames
+lmheatmap_pval<- covariates[0,]
+
+for(j in 1:15){
+    l<-list()
+    pval<- list()
+    for(i in colnames(lmheatmap))
+    {
+        
+        testdf<- data.frame(Z=Z[[j]], cov=covariates[[i]])
+        
+        lmmodel<- summary(lm(cov ~ Z, data = testdf))
+        l<- c(l, lmmodel$r.squared)
+        pval<- c(pval, lmmodel$coefficients[2,4])
+    }
+    
+    l<- as.data.frame(t(l))
+    colnames(l)<- colnames(lmheatmap)
+    lmheatmap<- rbind(lmheatmap, l)
+    
+    pval<- as.data.frame(t(pval))
+    colnames(pval)<- colnames(lmheatmap_pval)
+    lmheatmap_pval <- rbind(lmheatmap_pval, pval)
+    
+}
+lmheatmap<- as.data.frame(lmheatmap)
+#lmheatmap$TreatmentCode<- as.numeric(lmheatmap$TreatmentCode)
+lmheatmap$V2Age<- as.numeric(lmheatmap$V2Age)
+lmheatmap$AgeAtOnset<- as.numeric(lmheatmap$AgeAtOnset)
+lmheatmap$SexCode<- as.numeric(lmheatmap$SexCode)
+lmheatmap$timepoint<- as.numeric(lmheatmap$timepoint)
+lmheatmap$CTGDiagnostic<- as.numeric(lmheatmap$CTGDiagnostic)
+
+rownames(lmheatmap)<-r2perfactor$Var1[1:15]
+lmheatmap$factor<-r2perfactor$Var1[1:15]
+lmmelt<- melt(lmheatmap, id.vars = "factor")
+
+lmheatmap_pval<- as.data.frame(lmheatmap_pval)
+lmheatmap_pval$V2Age<- as.numeric(lmheatmap_pval$V2Age)
+lmheatmap_pval$AgeAtOnset<- as.numeric(lmheatmap_pval$AgeAtOnset)
+lmheatmap_pval$SexCode<- as.numeric(lmheatmap_pval$SexCode)
+lmheatmap_pval$timepoint<- as.numeric(lmheatmap_pval$timepoint)
+lmheatmap_pval$CTGDiagnostic<- as.numeric(lmheatmap_pval$CTGDiagnostic)
+
+rownames(lmheatmap_pval)<-r2perfactor$Var1[1:15]
+lmheatmap_pval$factor<-r2perfactor$Var1[1:15]
+
+lmheatmap_pval<- melt(lmheatmap_pval, value.name = "pval")
+lmheatmap_pval<- as.data.frame(lmheatmap_pval)
+lmheatmap_pval$pval_adjusted<-p.adjust(lmheatmap_pval$pval, method="BH")
+```
+
+```{r}
+#get weights protein in Factor 3
+#Load DvA single omic data (6MWT lead hits) for rank plots
+
+topweights_protein_f3<- get_weights(MOFAobject_ran, views="protein", factors=3)
+topweights_protein_f3<- as.data.frame(topweights_protein_f3)
+topweights_protein_f3$protein<- rownames(topweights_protein_f3)
+topweights_protein_f3$Factor3<- abs(topweights_protein_f3$Factor3)
+topweights_protein_f3<- topweights_protein_f3[order(abs(topweights_protein_f3$Factor3), decreasing = TRUE),]
+
+
+dva_hits_SMWT<- read.csv(file.choose())
+
+topweights_protein_f3$rank<- 1:nrow(topweights_protein_f3)
+
+hitlist<- topweights_protein_f3$protein[1:73][topweights_protein_f3$protein[1:73] %in% dva_hits_SMWT$x]
+
+#print(dva_hits_SMWT[dva_hits_SMWT$x %in% hitlist,]) 
+
+#venn.diagram(x= list(topweights_protein_f3$protein[1:73], dva_hits_SMWT$x), filename="052724_SMWT_f3_venn.png", category.names = c("MOFA2", "DvA hits"), fill=c(ggplot2::alpha("#440154FF", 0.3), ggplot2::alpha("#FDE725FF", 0.3)), output=TRUE)
+
+```
+
+
+```{r}
+#get weights protein in Factor 2 and 4
+#Load DvA single omic data (CTG lead hits) for rank plots
+topweights_protein_f4<- get_weights(MOFAobject_ran, views="protein", factors=4)
+topweights_protein_f4<- as.data.frame(topweights_protein_f4)
+topweights_protein_f4$protein<- rownames(topweights_protein_f4)
+topweights_protein_f4$Factor4<- abs(topweights_protein_f4$Factor4)
+topweights_protein_f4<- topweights_protein_f4[order(topweights_protein_f4$Factor4, decreasing = TRUE),]
+
+topweights_protein_f2<- get_weights(MOFAobject_ran, views="protein", factors=2)
+topweights_protein_f2<- as.data.frame(topweights_protein_f2)
+topweights_protein_f2$protein<- rownames(topweights_protein_f2)
+topweights_protein_f2$Factor4<- abs(topweights_protein_f2$Factor2)
+topweights_protein_f2<- topweights_protein_f2[order(topweights_protein_f2$Factor2, decreasing = TRUE),]
+
+
+
+dva_hits_CTG<- read.csv(file.choose())
+
+topweights_protein_f4$rank<- 1:nrow(topweights_protein_f4)
+
+#What overlap topweights ~ CTG hits DvA in top 50
+#print(topweights_protein_f4[1:50,][topweights_protein_f4$protein[1:50] %in% dva_hits_CTG$x[1:50],])
+
+
+ 
+
+  
+``` 
+
+```{r}
+#-----Get all weights (protein, phenotype)
+weights<-get_weights(MOFAobject_ran, views="all", factors="all")
+protein.weights<-as.data.frame(weights$protein)
+#rna.weights<-as.data.frame(weights$rna)
+phenotype.weights<-as.data.frame(weights$phenotype)
+```
+
+
+
+#-------------------------------------------------------------------------------
+
+```{r}
+#-----Sanity check; verify whether factors are largely uncorrelated:
+      plot_factor_cor(MOFAobject_ran)
+```
+
+*Usage of function "regressor()":*
+soutcome= String, Outcome or covariate to correlate from MOFA2 model metadata
+nfactor= Integer, Factor to use to retrieve top features
+nfeature=Either an integer depicting the top n features to extract from factor, or a (list of) string of specific features to check
+colby= String, covariate to color the points
+returncorr= Return spearman correlations, not figures. Default=FALSE
+
+```{r}
+#Numbers used in paper; CTG~factor 2 (protein only)(Model1)
+regressor("V2Mode", nfactor = 2, nfeature = 9, colby="timepoint", returncorr=TRUE)
+regressor("V2Mode", nfactor = 2, nfeature = 9, colby="timepoint", returncorr=TRUE)$p.adj 
+```
+
+```{r}
+#Numbers used in paper; 6MWT~factor 3 (protein only)(Model 1)
+regressor("SMWT", nfactor = 3, nfeature = 9, colby="timepoint", returncorr=TRUE)
+regressor("SMWT", nfactor = 3, nfeature = 9, colby="timepoint", returncorr=TRUE)$p.adj
+```
+
+
+#Figures:
+#Protein variance over top 5 29.3%
+#phenotype variance 33.9%
+
+```{r}
+#variance per factor (Model 1) (Figure 1 appendix chapter)
+fig1a<-plot_variance_explained(MOFAobject_ran, plot_total = F)+
+  theme(axis.text.x = element_text(size=12), axis.text.y = element_text(size=12),text=element_text(family = "baskerville"))+
+  ggtitle("(a)")
+
+fig1b  <-ggplot(lmmelt, 
+       aes(x = variable, y = factor, fill = value)) +
+    geom_tile(color="black") +
+    theme_classic()+
+    theme(axis.line.y=element_blank(), axis.line.x=element_blank())+
+    scale_fill_gradient2(low = "white", 
+                         high = "navy", 
+                         limits=c(0,0.15), 
+                         oob = scales::squish) +
+    guides(fill=guide_colourbar(title="R2"))+
+       theme(axis.text.x = element_text(size=12), axis.text.y = element_text(size=12),text=element_text(family = "baskerville"), legend.position = "none")+
+ylab("")+
+xlab("")+
+  ggtitle("(b)")
+levels(fig1b$data$variable)<- c("Age", "Age(Onset)", "Sex", "Timepoint", "CTG") #Change column names
+
+figure1<-ggarrange(fig1a, fig1b)
+print(figure1)
+```
+
+  
+```{r}
+#Spearman correlations of factors with clinical outcomes (Figure 2)
+#Mask spearman rho by p<0.05 and merge figures 
+colorhue<- colorRampPalette(c("#440154FF" ,"white", "#FDE725FF"))(n=300)    
+		  
+#corr factors with clinical outcomes
+fig2a<- corr_factors_cov_spearman(MOFAobject_ran, covariates = rownames(clinoutcomes_scaled), plot = "r") +
+    scale_x_discrete(labels=c(1:15)) +
+    theme(axis.text.x = element_text(angle=0, vjust=0, hjust=0.5))+
+    scale_fill_gradient2(low="#440154FF", mid = "white", high = "#FDE725FF")+
+    theme(text=element_text(family = "baskerville"))+
+    guides(fill=guide_colourbar(title="rho"))+
+    ggtitle("(a)")
+    
+fig2b<- corr_factors_cov_spearman(MOFAobject_ran, covariates = rownames(clinoutcomes_scaled), plot = "p") +
+    scale_x_discrete(labels=c(1:15)) +
+    theme(axis.text.x = element_text(angle=0, vjust=0, hjust=0.5))+
+    scale_fill_gradientn(colors=c("#440154FF","#FFFFFFFF"), values = c(0,0.05), na.value = "transparent")+
+    theme(text=element_text(family = "baskerville"))+
+     guides(fill=guide_colourbar(title="p-value"))+
+    ggtitle("(b)")
+      
+lev<- levels(fig2a$data$Var2)
+lev[2]<-"6MWT"
+levels(fig2a$data$Var2)<- lev
+
+lev<- levels(fig2b$data$Var2)
+lev[2]<-"6MWT"
+levels(fig2b$data$Var2)<- lev
+
+#Heatmap weights per factor
+#fig2b<- heatmap.2(weights$phenotype, Colv = FALSE, col=colorhue, tracecol = '#347FC4', sepcolor  = "black", colsep=1:ncol(weights$phenotype), rowsep=1:nrow(weights$phenotype), main="(b)", key.title = "Weight" ) 
+
+print(fig2a)
+print(fig2b) 
+
+
+ggarrange(fig2a, fig2b, ncol=2, nrow=1)
+
+fig2a$data$value[fig2b$data$value>0.05]<-0
+
+print(fig2a)
+
+
+#print(spearman_pval)
+```
+ 
+```{r}
+#Weight tables for factor 2 (model 1)(merged)
+tablef2_1<-plot_weights_mapped(MOFAobject_ran, view="protein", factor=2, nfeatures=25, scale=T)+
+  theme(text=element_text(family = "baskerville"))
+tablef2_2<- plot_top_weights(MOFAobject_ran, view="phenotype", factor=2, nfeatures=22, scale=T) +
+  theme(text=element_text(family = "baskerville"))  
+
+lv<- levels(tablef2_2$data$feature_id)
+lv[grep("SMWT", lv)]<- "6MWT"
+levels(tablef2_2$data$feature_id)<- lv
+
+ggarrange(tablef2_1, tablef2_2, ncol=2, nrow=1)
+
+#Correlation plots for factor 2 (model 1)
+regressor("V2Mode", nfactor = 2, nfeature = 9, colby="timepoint", ncoln = 3, nrown = 3) 
+
+```  
+ 
+```{r}
+#Weight tables for factor 2 (model 1)(merged)
+tablef3_1<-plot_weights_mapped(MOFAobject_ran, view="protein", factor=3, nfeatures=25, scale=T)+
+  theme(text=element_text(family = "baskerville"))
+tablef3_2<- plot_top_weights(MOFAobject_ran, view="phenotype", factor=3, nfeatures=22, scale=T) +
+  theme(text=element_text(family = "baskerville"))  
+
+lv<- levels(tablef3_2$data$feature_id)
+lv[grep("SMWT", lv)]<- "6MWT"
+levels(tablef3_2$data$feature_id)<- lv
+
+
+ggarrange(tablef3_1, tablef3_2, ncol=2, nrow=1)
+
+#Correlation plots for factor 2 (model 1)
+regressor("SMWT", nfactor = 3, nfeature = 9, colby="timepoint", ncoln = 3, nrown = 3)  
+
+
+``` 
+
+```{r}
+#rankplots for validating model 
+print(rankplot(mapProtein(dva_hits_CTG$x[1:40]), mapProtein(topweights_protein_f2$protein[1:40])))
+print(rankplot(mapProtein(dva_hits_CTG$x[1:40]), mapProtein(topweights_protein_f4$protein[1:40])))
+
+print(rankplot(mapProtein(dva_hits_SMWT$x[1:40]), mapProtein(topweights_protein_f3$protein[1:40])))
+```
+
+
